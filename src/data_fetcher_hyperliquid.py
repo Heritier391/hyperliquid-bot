@@ -1,352 +1,431 @@
-# core/data_fetcher_hyperliquid.py
-# -*- coding: utf-8 -*-
-"""
-Data fetcher Hyperliquid avec:
-- Fetch natif multi-timeframes (incl. 4h)
-- Fallback agrégation 1h -> 4h si API 4h indisponible
-- Mise à jour incrémentale par timeframe (pas de refetch massif)
-- Calcul trainable_score + trainable adapté à la profondeur réelle
-- Conservation des symboles récents même non-trainables
-
-Dépendance facultative: core.perp_hyperliquid (déjà présent chez toi)
-"""
-
-from __future__ import annotations
+import asyncio
+import aiosqlite
+import pandas as pd
 import time
-import math
-import logging
-import sqlite3
-from typing import Dict, Iterable, List, Tuple, Optional
+from datetime import datetime, timedelta
+from tqdm import tqdm
+import os
+import aiohttp
+from src.perp_hyperliquid import PerpHyperliquid
 
-try:
-    # Ton module interne validé le 2025-08-03
-    from core.perp_hyperliquid import get_ohlcv  # type: ignore
-    _HAS_NATIVE = True
-except Exception:
-    # Si la signature diffère, on gérera via fallback agrégation 1h->4h
-    _HAS_NATIVE = False
+# Chemin de la base de données
+DB_PATH = "data/hyperliquid_v2.db"
+TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h"]
 
-logger = logging.getLogger("DataFetcherHL")
-
-# --- Mapping TF -> durée ms
-HOUR_MS = 60 * 60 * 1000
-TF_MS = {
-    "1m": 60 * 1000,
-    "5m": 5 * 60 * 1000,
-    "15m": 15 * 60 * 1000,
-    "1h": HOUR_MS,
-    "4h": 4 * HOUR_MS,
+# Seuils de durée minimale par timeframe (en jours)
+MIN_DAYS_REQUIRED = {
+    "1m": 60,    # 2 mois
+    "5m": 90,     # 3 mois
+    "15m": 120,   # 4 mois
+    "1h": 180,    # 6 mois
+    "4h": 365     # 1 an
 }
 
-# --- Seuils réalistes (adaptés à ta profondeur réelle HL)
-MIN_CANDLES = {
-    "1m": 3000,   # ~2-3 jours utiles
-    "5m": 1000,
-    "15m": 500,
-    "1h": 200,
-    "4h": 80,
+# Poids pour le calcul du score global
+TIMEFRAME_WEIGHTS = {
+    "1m": 0.1,
+    "5m": 0.15,
+    "15m": 0.2,
+    "1h": 0.25,
+    "4h": 0.3
 }
 
-# --- Poids pour le score (simples et interprétables)
-SCORE_WEIGHTS = {
-    "1m": 0.5,
-    "5m": 0.8,
-    "15m": 1.2,
-    "1h": 2.0,
-    "4h": 3.0,
-}
-SCORE_CAP = 20000.0  # on cap au même max que ce que tu as déjà en base
+def timeframe_to_ms(timeframe: str) -> int:
+    """Convertit un timeframe en millisecondes"""
+    return {
+        "1m": 60000,
+        "5m": 300000,
+        "15m": 900000,
+        "1h": 3600000,
+        "4h": 14400000
+    }[timeframe]
 
-# ---------------------- Utilitaires SQL ---------------------- #
-
-def _ensure_tables(conn: sqlite3.Connection) -> None:
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS symbols (
-      symbol TEXT PRIMARY KEY,
-      trainable INTEGER DEFAULT 0,
-      trainable_score REAL DEFAULT 0
-    )
-    """)
-    for tf in ("1m","5m","15m","1h","4h"):
-        cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS ohlcv_{tf} (
-          symbol TEXT NOT NULL,
-          timestamp INTEGER NOT NULL,
-          open REAL NOT NULL,
-          high REAL NOT NULL,
-          low REAL NOT NULL,
-          close REAL NOT NULL,
-          volume REAL DEFAULT 0,
-          PRIMARY KEY (symbol, timestamp)
-        )
-        """)
-    conn.commit()
-
-def _max_ts(conn: sqlite3.Connection, tf: str, symbol: str) -> Optional[int]:
-    cur = conn.cursor()
-    row = cur.execute(f"SELECT MAX(timestamp) FROM ohlcv_{tf} WHERE symbol=?", (symbol,)).fetchone()
-    return row[0] if row and row[0] is not None else None
-
-def _upsert_ohlcv(conn: sqlite3.Connection, tf: str, symbol: str, rows: List[Tuple[int,float,float,float,float,float]]) -> int:
-    """rows: List[(ts, o, h, l, c, v)] en millisecondes, ts alignés TF."""
-    if not rows:
-        return 0
-    cur = conn.cursor()
-    cur.executemany(
-        f"""INSERT OR REPLACE INTO ohlcv_{tf} (symbol, timestamp, open, high, low, close, volume)
-            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        [(symbol, ts, o, h, l, c, v) for (ts, o, h, l, c, v) in rows]
-    )
-    conn.commit()
-    return len(rows)
-
-def _count_by_tf(conn: sqlite3.Connection, symbol: str) -> Dict[str, int]:
-    cur = conn.cursor()
-    out = {}
-    for tf in ("1m","5m","15m","1h","4h"):
-        row = cur.execute(f"SELECT COUNT(*) FROM ohlcv_{tf} WHERE symbol=?", (symbol,)).fetchone()
-        out[tf] = int(row[0] or 0)
-    return out
-
-# ---------------------- Fetch natif ---------------------- #
-
-def _fetch_native(symbol: str, tf: str, since_ms: int, until_ms: int) -> List[Tuple[int,float,float,float,float,float]]:
-    """Appel l’API interne si dispo. Retour: [(ts,o,h,l,c,v), ...] triés par ts asc."""
-    if not _HAS_NATIVE:
-        return []
-    # NOTE: adapte si ta fonction a une signature différente
-    # Ex attendu: get_ohlcv(symbol, timeframe, start_ts, end_ts) -> List[dict/tuple]
+async def fetch_symbols() -> list:
+    """Récupère dynamiquement les symboles via POST"""
+    url = "https://api.hyperliquid.xyz/info"
+    payload = {"type": "meta"}
     try:
-        data = get_ohlcv(symbol, tf, since_ms, until_ms)  # type: ignore
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as resp:
+                data = await resp.json()
+                return [s["name"] for s in data["universe"]]
     except Exception as e:
-        logger.warning("Native fetch failed %s %s: %s", symbol, tf, e)
+        print(f"❌ Erreur récupération symboles: {e}")
         return []
-    out: List[Tuple[int,float,float,float,float,float]] = []
-    for r in data or []:
-        # Adapte si 'r' est dict: r["t"], r["o"], ...
-        if isinstance(r, dict):
-            ts = int(r.get("timestamp") or r.get("t"))
-            o = float(r.get("open") or r.get("o"))
-            h = float(r.get("high") or r.get("h"))
-            l = float(r.get("low") or r.get("l"))
-            c = float(r.get("close") or r.get("c"))
-            v = float(r.get("volume") or r.get("v") or 0.0)
-        else:
-            # suppose tuple-like
-            ts, o, h, l, c, v = r
-        out.append((ts, o, h, l, c, v))
-    out.sort(key=lambda x: x[0])
-    return out
 
-# ---------------------- Agrégation 1h -> 4h ---------------------- #
+async def init_db(db_path: str):
+    """Création des tables si inexistantes"""
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS symbols (
+                symbol TEXT PRIMARY KEY,
+                trainable INTEGER,
+                trainable_score REAL,
+                last_updated DATETIME
+            );
+        """)
+        
+        # Table pour stocker les métadonnées des timeframes
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS timeframe_metadata (
+                symbol TEXT,
+                timeframe TEXT,
+                first_timestamp DATETIME,
+                last_timestamp DATETIME,
+                PRIMARY KEY (symbol, timeframe)
+            );
+        """)
+        
+        for tf in TIMEFRAMES:
+            table_name = f"ohlcv_{tf}"
+            await db.execute(f"""
+                CREATE TABLE IF NOT EXISTS {table_name} (
+                    symbol TEXT,
+                    timestamp DATETIME,
+                    open REAL,
+                    high REAL,
+                    low REAL,
+                    close REAL,
+                    volume REAL,
+                    PRIMARY KEY (symbol, timestamp)
+                );
+            """)
+        await db.commit()
 
-def _aggregate_1h_to_4h(conn: sqlite3.Connection, symbol: str, since_ms: Optional[int] = None) -> int:
-    """Agrège les bougies 1h en 4h (fallback) à partir de since_ms."""
-    cur = conn.cursor()
-    if since_ms is None:
-        since_clause = ""
-        params: Tuple = (symbol,)
-    else:
-        since_clause = "AND timestamp >= ?"
-        params = (symbol, since_ms)
-
-    rows = cur.execute(f"""
-    SELECT timestamp, open, high, low, close, COALESCE(volume,0)
-    FROM ohlcv_1h
-    WHERE symbol = ? {since_clause}
-    ORDER BY timestamp ASC
-    """, params).fetchall()
-
-    if not rows:
-        return 0
-
-    inserted = 0
-    bucket_ts = None
-    o = h = l = c = v = None
-    count = 0
-
-    def flush(bkt_ts, o_, h_, l_, c_, v_):
-        nonlocal inserted
-        cur.execute("""
-            INSERT OR REPLACE INTO ohlcv_4h (symbol, timestamp, open, high, low, close, volume)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (symbol, bkt_ts, o_, h_, l_, c_, v_))
-        inserted += 1
-
-    for ts, _o, _h, _l, _c, _v in rows:
-        bkt = (ts // TF_MS["4h"]) * TF_MS["4h"]
-        if bucket_ts is None:
-            bucket_ts = bkt
-            o, h, l, c, v = _o, _h, _l, _c, _v
-            count = 1
-        elif bkt == bucket_ts:
-            h = max(h, _h)
-            l = min(l, _l)
-            c = _c
-            v = (v or 0) + (_v or 0)
-            count += 1
-        else:
-            if count >= 1:
-                flush(bucket_ts, o, h, l, c, v or 0)
-            bucket_ts = bkt
-            o, h, l, c, v = _o, _h, _l, _c, _v
-            count = 1
-    if bucket_ts is not None and count >= 1:
-        flush(bucket_ts, o, h, l, c, v or 0)
-
-    conn.commit()
-    return inserted
-
-# ---------------------- Incrémental ---------------------- #
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
-
-def update_symbol_incremental(
-    conn: sqlite3.Connection,
-    symbol: str,
-    timeframes: Iterable[str] = ("1m","5m","15m","1h","4h"),
-    lookback_hours_if_empty: int = 72,
-    native4h_first: bool = True,
-) -> Dict[str, int]:
-    """
-    Met à jour un symbole incrémentalement pour les TF demandées.
-    - Si 4h est demandé:
-        * tente le fetch natif 4h
-        * sinon agrège 1h->4h
-    Retourne un dict tf -> nb_lignes_insérées
-    """
-    _ensure_tables(conn)
-    cur = conn.cursor()
-    cur.execute("INSERT OR IGNORE INTO symbols(symbol) VALUES (?)", (symbol,))
-    conn.commit()
-
-    inserted_by_tf: Dict[str, int] = {}
-
-    now = _now_ms()
-    for tf in timeframes:
-        if tf not in TF_MS:
-            continue
-
-        last_ts = _max_ts(conn, tf, symbol)
-        if last_ts is None:
-            since_ms = now - lookback_hours_if_empty * HOUR_MS
-        else:
-            since_ms = last_ts + TF_MS[tf]
-
-        # bornage
-        if since_ms > now:
-            inserted_by_tf[tf] = 0
-            continue
-
-        # fetch par batch (utile si API pagine)
-        batch_inserted = 0
-        cursor = since_ms
-        # fenêtre de batch ~ 7 jours par appel pour limiter la charge
-        batch_span = 7 * 24 * HOUR_MS
-
-        while cursor <= now:
-            until = min(cursor + batch_span, now)
-
-            rows: List[Tuple[int,float,float,float,float,float]] = []
-            if tf == "4h" and native4h_first:
-                rows = _fetch_native(symbol, "4h", cursor, until)
-
-            if tf != "4h":
-                rows = _fetch_native(symbol, tf, cursor, until)
-            elif tf == "4h" and not rows:
-                # fallback: aggréger 1h -> 4h à partir de "cursor"
-                # d'abord, s'assurer d'avoir la 1h jusqu'à "until"
-                _ = _fetch_and_store_native(conn, symbol, "1h", cursor, until)
-                # puis agrégation
-                _ = _aggregate_1h_to_4h(conn, symbol, since_ms=cursor)
-                # on ne sait pas combien de lignes exactes via agrég. On recalcule après.
-                # on ne met pas rows ici.
-
-            if rows:
-                batch_inserted += _upsert_ohlcv(conn, tf, symbol, rows)
-
-            # avance
-            cursor = until + TF_MS[tf]
-
-        inserted_by_tf[tf] = batch_inserted if tf != "4h" else _count_ohlcv_rows_new_since(conn, "4h", symbol, last_ts)
-
-    return inserted_by_tf
-
-def _fetch_and_store_native(conn: sqlite3.Connection, symbol: str, tf: str, since_ms: int, until_ms: int) -> int:
-    rows = _fetch_native(symbol, tf, since_ms, until_ms)
-    if not rows:
-        return 0
-    return _upsert_ohlcv(conn, tf, symbol, rows)
-
-def _count_ohlcv_rows_new_since(conn: sqlite3.Connection, tf: str, symbol: str, prev_max_ts: Optional[int]) -> int:
-    cur = conn.cursor()
-    if prev_max_ts is None:
-        row = cur.execute(f"SELECT COUNT(*) FROM ohlcv_{tf} WHERE symbol=?", (symbol,)).fetchone()
-    else:
-        row = cur.execute(f"SELECT COUNT(*) FROM ohlcv_{tf} WHERE symbol=? AND timestamp>?",
-                          (symbol, prev_max_ts)).fetchone()
-    return int(row[0] or 0)
-
-# ---------------------- Trainable score/flag ---------------------- #
-
-def recompute_trainable_flags(conn: sqlite3.Connection, verbose: bool = True) -> None:
-    """
-    Fixe trainable_score et trainable selon la profondeur réelle.
-    Règles (OR):
-      - (1h >= 200 ET 15m >= 500)
-      - OU (4h >= 80)
-      - OU (5m >= 1000)
-    Score = somme(w_tf * n_tf), cap à 20000.
-    """
-    cur = conn.cursor()
-    syms = [r[0] for r in cur.execute("SELECT symbol FROM symbols").fetchall()]
-    for s in syms:
-        counts = _count_by_tf(conn, s)
-
-        score = 0.0
-        for tf, n in counts.items():
-            score += SCORE_WEIGHTS.get(tf, 0.0) * float(n)
-        score = min(score, SCORE_CAP)
-
-        cond = (
-            (counts.get("1h", 0) >= MIN_CANDLES["1h"] and counts.get("15m", 0) >= MIN_CANDLES["15m"])
-            or (counts.get("4h", 0) >= MIN_CANDLES["4h"])
-            or (counts.get("5m", 0) >= MIN_CANDLES["5m"])
+async def get_last_db_timestamp(db: aiosqlite.Connection, symbol: str, timeframe: str) -> int:
+    """Récupère le dernier timestamp en base pour un symbol/timeframe"""
+    table_name = f"ohlcv_{timeframe}"
+    try:
+        cursor = await db.execute(
+            f"SELECT MAX(timestamp) FROM {table_name} WHERE symbol = ?",
+            (symbol,)
         )
-        trainable = 1 if cond else 0
+        row = await cursor.fetchone()
+        await cursor.close()
+        
+        if row and row[0]:
+            last_dt = pd.to_datetime(row[0])
+            return int(last_dt.timestamp() * 1000)  # Convertir en ms
+    except Exception as e:
+        print(f"⚠️ Erreur récupération dernier timestamp: {symbol} {timeframe} - {e}")
+    return None
 
-        cur.execute("UPDATE symbols SET trainable=?, trainable_score=? WHERE symbol=?",
-                    (trainable, float(score), s))
-        if verbose:
-            logger.info(
-                "trainable[%s]=%s score=%.1f (1m=%d 5m=%d 15m=%d 1h=%d 4h=%d)",
-                s, trainable, score,
-                counts.get("1m",0), counts.get("5m",0), counts.get("15m",0),
-                counts.get("1h",0), counts.get("4h",0),
+async def get_first_db_timestamp(db: aiosqlite.Connection, symbol: str, timeframe: str) -> int:
+    """Récupère le premier timestamp en base pour un symbol/timeframe"""
+    table_name = f"ohlcv_{timeframe}"
+    try:
+        cursor = await db.execute(
+            f"SELECT MIN(timestamp) FROM {table_name} WHERE symbol = ?",
+            (symbol,)
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        
+        if row and row[0]:
+            first_dt = pd.to_datetime(row[0])
+            return int(first_dt.timestamp() * 1000)  # Convertir en ms
+    except Exception as e:
+        print(f"⚠️ Erreur récupération premier timestamp: {symbol} {timeframe} - {e}")
+    return None
+
+async def update_timeframe_metadata(db: aiosqlite.Connection, symbol: str, timeframe: str):
+    """Met à jour les métadonnées pour un symbol/timeframe"""
+    table_name = f"ohlcv_{timeframe}"
+    try:
+        # Récupérer le premier et dernier timestamp
+        cursor = await db.execute(
+            f"SELECT MIN(timestamp), MAX(timestamp) FROM {table_name} WHERE symbol = ?",
+            (symbol,)
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        
+        if row and row[0] and row[1]:
+            await db.execute("""
+                INSERT OR REPLACE INTO timeframe_metadata 
+                (symbol, timeframe, first_timestamp, last_timestamp)
+                VALUES (?, ?, ?, ?)
+            """, (symbol, timeframe, row[0], row[1]))
+            await db.commit()
+    except Exception as e:
+        print(f"⚠️ Erreur mise à jour métadonnées: {symbol} {timeframe} - {e}")
+
+def compute_trainable_score(df: pd.DataFrame, timeframe: str) -> float:
+    """Calcul d'un score trainable basé sur les données disponibles"""
+    if df.empty or len(df) < 100:
+        return 0.0
+    
+    # Récupérer le seuil minimal pour ce timeframe
+    min_days = MIN_DAYS_REQUIRED.get(timeframe, 180)
+    
+    # Calculer la durée réelle en jours
+    min_date = df["timestamp"].min()
+    max_date = df["timestamp"].max()
+    duration_days = (max_date - min_date).days
+    
+    # Calcul des métriques
+    completeness = min(1.0, duration_days / min_days)
+    volatility = df["close"].pct_change().std() * (len(df) ** 0.5)  # Volatilité annualisée
+    liquidity = df["volume"].mean()
+    
+    # Normalisation des métriques
+    volatility_norm = min(1.0, volatility * 100)  # Supposant que 100% = volatilité très élevée
+    liquidity_norm = min(1.0, liquidity / 10000)  # Supposant 10k USD = bonne liquidité
+    
+    # Score composé
+    score = (0.5 * completeness + 
+             0.3 * volatility_norm + 
+             0.2 * liquidity_norm)
+    
+    # Application du poids du timeframe
+    return score * TIMEFRAME_WEIGHTS.get(timeframe, 0.5)
+
+async def fetch_incremental_ohlcv(symbol: str, timeframe: str, db: aiosqlite.Connection) -> pd.DataFrame:
+    """Télécharge uniquement les nouvelles données depuis la dernière timestamp en base"""
+    client = PerpHyperliquid()
+    try:
+        # Récupérer le dernier timestamp en base
+        last_ts = await get_last_db_timestamp(db, symbol, timeframe)
+        interval_ms = timeframe_to_ms(timeframe)
+        end_ts = int(time.time() * 1000)
+        all_data = []
+        
+        # Déterminer le point de départ
+        if last_ts:
+            start_ts = last_ts + interval_ms
+            print(f"ℹ️ {symbol} {timeframe}: Mise à jour depuis {datetime.fromtimestamp(last_ts/1000)}")
+        else:
+            # Première synchronisation
+            first_ts = await client.get_first_candle_timestamp(symbol, timeframe)
+            if not first_ts:
+                print(f"⚠️ Aucune première bougie trouvée pour {symbol} {timeframe}")
+                return pd.DataFrame()
+            start_ts = first_ts
+            print(f"ℹ️ {symbol} {timeframe}: Premier téléchargement depuis {datetime.fromtimestamp(first_ts/1000)}")
+        
+        # Vérifier s'il y a de nouvelles données
+        if start_ts >= end_ts:
+            print(f"✅ {symbol} {timeframe}: Déjà à jour")
+            return pd.DataFrame()
+        
+        current_ts = start_ts
+        max_candles = 5000
+        
+        # Calcul du nombre total de bougies estimé
+        total_candles = (end_ts - current_ts) // interval_ms
+        print(f"📊 Téléchargement {symbol} {timeframe}: ~{total_candles} nouvelles bougies")
+        
+        # Créer une barre de progression
+        progress_bar = tqdm(total=total_candles, 
+                          desc=f"{symbol} {timeframe}", 
+                          leave=False)
+        
+        retry_count = 0
+        max_retries = 5
+        
+        while current_ts < end_ts:
+            try:
+                # Calculer le nombre de bougies dans ce segment
+                segment_candles = min(max_candles, (end_ts - current_ts) // interval_ms + 1)
+                if segment_candles <= 0:
+                    break
+                    
+                segment_end_ts = current_ts + (segment_candles * interval_ms)
+                
+                df = await client.get_ohlcv(
+                    f"{symbol}/USD", 
+                    timeframe, 
+                    start_time=current_ts,
+                    end_time=segment_end_ts
+                )
+                
+                if df.empty:
+                    # Avancer d'un segment complet
+                    current_ts = segment_end_ts
+                    progress_bar.update(segment_candles)
+                    continue
+                
+                # Convertir et ajouter les données
+                df = df.reset_index()
+                df = df.rename(columns={'date': 'timestamp'})
+                all_data.append(df[['timestamp', 'open', 'high', 'low', 'close', 'volume']])
+                
+                # Mettre à jour la progression
+                downloaded_candles = len(df)
+                progress_bar.update(downloaded_candles)
+                
+                # Avancer au prochain segment
+                if not df.empty:
+                    last_ts = int(df["timestamp"].iloc[-1].timestamp() * 1000)
+                    current_ts = last_ts + interval_ms
+                else:
+                    current_ts = segment_end_ts
+                
+                # Réinitialiser le compteur de réessais
+                retry_count = 0
+                
+                # Pause pour éviter le rate limiting
+                await asyncio.sleep(0.3)
+                
+            except Exception as e:
+                retry_count += 1
+                if retry_count > max_retries:
+                    print(f"❌ Échec après {max_retries} tentatives pour {symbol} {timeframe}")
+                    break
+                    
+                wait_time = 2 ** retry_count
+                print(f"⚠️ Erreur segment {symbol} {timeframe}: {e}. Réessai dans {wait_time}s...")
+                await asyncio.sleep(wait_time)
+        
+        progress_bar.close()
+        
+        if all_data:
+            full_df = pd.concat(all_data, ignore_index=True)
+            full_df = full_df.drop_duplicates('timestamp').sort_values('timestamp')
+            full_df = full_df.reset_index(drop=True)
+            
+            # Vérifier la continuité
+            if len(full_df) > 1:
+                time_diffs = full_df['timestamp'].diff().dt.total_seconds()
+                expected_diff = interval_ms / 1000
+                irregular = ((abs(time_diffs - expected_diff) > 10) & (abs(time_diffs - expected_diff) < 300) & time_diffs.notna()).sum()
+                if irregular > 0:
+                    irregular_indices = full_df.index[(abs(time_diffs - expected_diff) > tolerance) & time_diffs.notna()]
+                    print(f"⚠️ {symbol} {timeframe}: {irregular} intervalles irréguliers aux positions: {irregular_indices.tolist()}")
+                    # Afficher les timestamps problématiques
+                    for idx in irregular_indices:
+                        print(f"  - {full_df.loc[idx, 'timestamp']} (diff: {time_diffs[idx]:.1f}s)")
+            
+            print(f"✅ {symbol} {timeframe}: {len(full_df)} nouvelles bougies téléchargées")
+            return full_df
+            
+        return pd.DataFrame()
+        
+    except Exception as e:
+        print(f"❌ Erreur pour {symbol} {timeframe}: {e}")
+        return pd.DataFrame()
+    finally:
+        await client.close()
+
+async def load_db_data(db: aiosqlite.Connection, symbol: str, timeframe: str) -> pd.DataFrame:
+    """Charge toutes les données d'un symbol/timeframe depuis la base"""
+    table_name = f"ohlcv_{timeframe}"
+    try:
+        cursor = await db.execute(
+            f"SELECT * FROM {table_name} WHERE symbol = ? ORDER BY timestamp",
+            (symbol,)
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        
+        if not rows:
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(rows, columns=['symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        return df
+    
+    except Exception as e:
+        print(f"⚠️ Erreur chargement données: {symbol} {timeframe} - {e}")
+        return pd.DataFrame()
+
+async def process_symbol(symbol: str, db_path: str):
+    """Traitement incrémental d'un symbole"""
+    async with aiosqlite.connect(db_path) as db:
+        dfs = {}
+        timeframe_scores = {}
+        updated = False
+        
+        for tf in TIMEFRAMES:
+            # Télécharger les nouvelles données
+            df_new = await fetch_incremental_ohlcv(symbol, tf, db)
+            
+            if df_new.empty:
+                # Charger les données existantes
+                df = await load_db_data(db, symbol, tf)
+                dfs[tf] = df
+                continue
+            
+            # Charger les données existantes
+            df_existing = await load_db_data(db, symbol, tf)
+            
+            # Fusionner avec les nouvelles données
+            if not df_existing.empty:
+                df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+                df_combined = df_combined.drop_duplicates('timestamp').sort_values('timestamp')
+            else:
+                df_combined = df_new
+            
+            # Mettre à jour la base de données
+            if not df_new.empty:
+                # Convertir les timestamps en format string pour SQLite
+                df_new["timestamp_str"] = df_new["timestamp"].dt.strftime('%Y-%m-%d %H:%M:%S')
+                data_tuples = [
+                    (symbol, row["timestamp_str"], row["open"], row["high"], row["low"], row["close"], row["volume"])
+                    for _, row in df_new.iterrows()
+                ]
+                
+                # Insérer par batch
+                for i in range(0, len(data_tuples), 1000):
+                    batch = data_tuples[i:i+1000]
+                    await db.executemany(
+                        f"""
+                        INSERT OR IGNORE INTO ohlcv_{tf} 
+                        (symbol, timestamp, open, high, low, close, volume)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        batch
+                    )
+                await db.commit()
+                
+                # Mettre à jour les métadonnées
+                await update_timeframe_metadata(db, symbol, tf)
+                updated = True
+            
+            dfs[tf] = df_combined
+        
+        # Calculer les scores seulement si mise à jour ou premier chargement
+        if updated or all(df.empty for df in dfs.values()):
+            for tf in TIMEFRAMES:
+                df = dfs.get(tf, pd.DataFrame())
+                if df.empty or len(df) < 100:
+                    print(f"⚠️ Données insuffisantes pour {symbol} sur {tf}")
+                    timeframe_scores[tf] = 0.0
+                else:
+                    timeframe_scores[tf] = compute_trainable_score(df, tf)
+            
+            # Calculer le score global
+            total_weight = sum(TIMEFRAME_WEIGHTS.values())
+            global_score = sum(
+                timeframe_scores[tf] * TIMEFRAME_WEIGHTS.get(tf, 0) 
+                for tf in TIMEFRAMES
+            ) / total_weight
+            
+            trainable = int(global_score >= 0.3)
+            
+            # Mettre à jour la table des symboles
+            now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+            await db.execute(
+                "INSERT OR REPLACE INTO symbols (symbol, trainable, trainable_score, last_updated) VALUES (?, ?, ?, ?);",
+                (symbol, trainable, global_score, now_str)
             )
-    conn.commit()
+            await db.commit()
+            print(f"💾 {symbol} sauvegardé - Score: {global_score:.2f} {'(Trainable)' if trainable else ''}")
+        else:
+            print(f"✅ {symbol} déjà à jour - Pas de changement")
 
-# ---------------------- Helpers haut niveau ---------------------- #
+async def run_data_fetcher(db_path: str = DB_PATH):
+    """Routine principale du data fetcher"""
+    await init_db(db_path)
+    symbols = await fetch_symbols()
+    print(f"🔍 {len(symbols)} symboles trouvés.")
+    
+    if not symbols:
+        print("❌ Aucun symbole trouvé, arrêt du data fetcher")
+        return
 
-def update_all_symbols_incremental(
-    conn: sqlite3.Connection,
-    symbols: Iterable[str],
-    timeframes: Iterable[str] = ("1m","5m","15m","1h","4h"),
-    lookback_hours_if_empty: int = 72,
-) -> Dict[str, Dict[str, int]]:
-    """
-    Met à jour tous les symboles fournis de manière incrémentale.
-    Retour: {symbol: {tf: inserted}}
-    """
-    out: Dict[str, Dict[str, int]] = {}
-    for s in symbols:
-        try:
-            out[s] = update_symbol_incremental(
-                conn, s, timeframes=timeframes, lookback_hours_if_empty=lookback_hours_if_empty
-            )
-        except Exception as e:
-            logger.exception("update_symbol_incremental failed for %s: %s", s, e)
-    recompute_trainable_flags(conn, verbose=False)
-    return out
+    # Traiter chaque symbole séquentiellement
+    for symbol in tqdm(symbols, desc="Mise à jour OHLCV"):
+        await process_symbol(symbol, db_path)
+
+    print("✅ Données mises à jour avec succès.")
