@@ -1,0 +1,17 @@
+websockets
+eth_account
+web3
+asyncio
+numpy
+pandas
+tensorflow
+python-dotenv
+ccxt
+pandas 
+pydantic 
+ta
+xgboost 
+scikit-learn
+torch
+matplotlib 
+tensorflow
